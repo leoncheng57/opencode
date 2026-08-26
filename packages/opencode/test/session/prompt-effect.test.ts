@@ -602,6 +602,108 @@ it.live("failed subtask preserves metadata on error tool state", () =>
   ),
 )
 
+it.live("task tool with an explicit unknown model fails at the same point as an agent-configured one", () =>
+  provideTmpdirServer(
+    Effect.fnUntraced(function* ({ llm }) {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* llm.tool("task", {
+        description: "inspect bug",
+        prompt: "look into the cache key path",
+        subagent_type: "general",
+        model: "test/missing-model",
+      })
+      yield* llm.text("done")
+      yield* user(chat.id, "hello")
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+      expect(result.info.role).toBe("assistant")
+      // the child never reached the LLM: the model was rejected while building its first message
+      expect(yield* llm.calls).toBe(2)
+
+      const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
+      const taskMsg = msgs.find(
+        (item) =>
+          item.info.role === "assistant" && item.parts.some((part) => part.type === "tool" && part.tool === "task"),
+      )
+      if (!taskMsg || taskMsg.info.role !== "assistant") return
+
+      const tool = errorTool(taskMsg.parts)
+      if (!tool) return
+
+      // the model is rejected downstream by the provider lookup inside the prompt path, not by the tool
+      expect(tool.state.error).toContain("ProviderModelNotFoundError")
+
+      // Consequence of validating late. Unlike the `handleSubtask` path above, which preserves
+      // metadata on an error state, the ordinary tool path discards it, so the failed part names
+      // neither the attempted model nor the child it already created.
+      expect(tool.state.metadata).toBeUndefined()
+
+      // ...and the child session is nonetheless created, and is left with a first message it can never answer
+      const kids = yield* sessions.children(chat.id)
+      expect(kids).toHaveLength(1)
+      expect(kids[0]?.parentID).toBe(chat.id)
+    }),
+    { git: true, config: providerCfg },
+  ),
+)
+
+it.live("task tool honors an explicit model over the agent-configured model end to end", () =>
+  provideTmpdirServer(
+    Effect.fnUntraced(function* ({ llm }) {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* llm.tool("task", {
+        description: "inspect bug",
+        prompt: "look into the cache key path",
+        subagent_type: "general",
+        model: "test/test-model",
+      })
+      yield* llm.text("child done")
+      yield* llm.text("done")
+      yield* user(chat.id, "hello")
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+      expect(result.info.role).toBe("assistant")
+
+      const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
+      const taskMsg = msgs.find(
+        (item) =>
+          item.info.role === "assistant" && item.parts.some((part) => part.type === "tool" && part.tool === "task"),
+      )
+      if (!taskMsg || taskMsg.info.role !== "assistant") return
+
+      // the agent is configured with `test/missing-model`, which would have failed;
+      // the explicit model overrides it, so the child runs to completion
+      const tool = completedTool(taskMsg.parts)
+      if (!tool) return
+      expect(tool.state.metadata?.model).toEqual({
+        providerID: ProviderID.make("test"),
+        modelID: ModelID.make("test-model"),
+      })
+    }),
+    {
+      git: true,
+      config: (url) => ({
+        ...providerCfg(url),
+        agent: {
+          general: {
+            model: "test/missing-model",
+          },
+        },
+      }),
+    },
+  ),
+)
+
 it.live(
   "running subtask preserves metadata after tool-call transition",
   () =>

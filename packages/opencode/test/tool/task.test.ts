@@ -384,4 +384,328 @@ describe("tool.task", () => {
       },
     ),
   )
+
+  it.live("execute uses an explicit model over the invoking assistant's model", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        let seen: SessionPrompt.PromptInput | undefined
+        const promptOps = stubOps({ onPrompt: (input) => (seen = input) })
+
+        const result = yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+            model: "anthropic/claude-sonnet-4-5",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        expect(seen?.model).toEqual({
+          providerID: ProviderID.make("anthropic"),
+          modelID: ModelID.make("claude-sonnet-4-5"),
+        })
+        expect(result.metadata.model).toEqual({
+          providerID: ProviderID.make("anthropic"),
+          modelID: ModelID.make("claude-sonnet-4-5"),
+        })
+        // the invoking assistant's model is `ref` and must not have been used
+        expect(seen?.model?.modelID).not.toBe(ref.modelID)
+      }),
+    ),
+  )
+
+  it.live("execute uses an explicit model over the subagent's configured model", () =>
+    provideTmpdirInstance(
+      () =>
+        Effect.gen(function* () {
+          const { chat, assistant } = yield* seed()
+          const tool = yield* TaskTool
+          const def = yield* tool.init()
+          const seen: (SessionPrompt.PromptInput | undefined)[] = []
+          const promptOps = stubOps({ onPrompt: (input) => seen.push(input) })
+
+          const exec = (model?: string) =>
+            def.execute(
+              {
+                description: "inspect bug",
+                prompt: "look into the cache key path",
+                subagent_type: "pinned",
+                ...(model ? { model } : {}),
+              },
+              {
+                sessionID: chat.id,
+                messageID: assistant.id,
+                agent: "build",
+                abort: new AbortController().signal,
+                extra: { promptOps },
+                messages: [],
+                metadata: () => Effect.void,
+                ask: () => Effect.void,
+              },
+            )
+
+          const pinned = yield* exec()
+          const overridden = yield* exec("openai/gpt-5")
+
+          // no explicit model: the agent's configured model wins over the assistant's
+          expect(pinned.metadata.model).toEqual({
+            providerID: ProviderID.make("test"),
+            modelID: ModelID.make("agent-model"),
+          })
+          expect(seen[0]?.model).toEqual({
+            providerID: ProviderID.make("test"),
+            modelID: ModelID.make("agent-model"),
+          })
+
+          // explicit model: beats the agent's configured model
+          expect(overridden.metadata.model).toEqual({
+            providerID: ProviderID.make("openai"),
+            modelID: ModelID.make("gpt-5"),
+          })
+          expect(seen[1]?.model).toEqual({
+            providerID: ProviderID.make("openai"),
+            modelID: ModelID.make("gpt-5"),
+          })
+        }),
+      {
+        config: {
+          agent: {
+            pinned: {
+              mode: "subagent",
+              model: "test/agent-model",
+            },
+          },
+        },
+      },
+    ),
+  )
+
+  it.live("execute omitting the model preserves the existing fallback chain", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        let seen: SessionPrompt.PromptInput | undefined
+        const promptOps = stubOps({ onPrompt: (input) => (seen = input) })
+
+        const result = yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        // `general` has no configured model, so the invoking assistant's model is inherited
+        expect(seen?.model).toEqual(ref)
+        expect(result.metadata.model).toEqual(ref)
+      }),
+    ),
+  )
+
+  it.live("execute applies an explicit model to a resumed task_id without creating a child", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const { chat, assistant } = yield* seed()
+        const child = yield* sessions.create({ parentID: chat.id, title: "Existing child" })
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const seen: SessionPrompt.PromptInput[] = []
+        const promptOps = stubOps({ text: "resumed", onPrompt: (input) => seen.push(input) })
+
+        const exec = (model?: string) =>
+          def.execute(
+            {
+              description: "inspect bug",
+              prompt: "look into the cache key path",
+              subagent_type: "general",
+              task_id: child.id,
+              ...(model ? { model } : {}),
+            },
+            {
+              sessionID: chat.id,
+              messageID: assistant.id,
+              agent: "build",
+              abort: new AbortController().signal,
+              extra: { promptOps },
+              messages: [],
+              metadata: () => Effect.void,
+              ask: () => Effect.void,
+            },
+          )
+
+        const overridden = yield* exec("openai/gpt-5")
+        const after = yield* exec()
+
+        const kids = yield* sessions.children(chat.id)
+        expect(kids).toHaveLength(1)
+        expect(kids[0]?.id).toBe(child.id)
+
+        // the explicit model reached the resumed child session
+        expect(overridden.metadata.sessionId).toBe(child.id)
+        expect(seen[0]?.sessionID).toBe(child.id)
+        expect(seen[0]?.model).toEqual({
+          providerID: ProviderID.make("openai"),
+          modelID: ModelID.make("gpt-5"),
+        })
+
+        // ...and was not persisted as a default for the next invocation of the same child
+        expect(after.metadata.sessionId).toBe(child.id)
+        expect(seen[1]?.model).toEqual(ref)
+        expect(after.metadata.model).toEqual(ref)
+        const reloaded = yield* sessions.get(child.id)
+        expect(reloaded.id).toBe(child.id)
+      }),
+    ),
+  )
+
+  it.live("execute reports the selected model in running and result metadata", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const updates: { title?: string; metadata?: any }[] = []
+        const promptOps = stubOps()
+
+        const result = yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+            model: "openai/gpt-5",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps },
+            messages: [],
+            metadata: (input) =>
+              Effect.sync(() => {
+                updates.push(input)
+              }),
+            ask: () => Effect.void,
+          },
+        )
+
+        const expected = { providerID: ProviderID.make("openai"), modelID: ModelID.make("gpt-5") }
+
+        // running metadata, emitted before the child is prompted
+        expect(updates).toHaveLength(1)
+        expect(updates[0]?.metadata?.model).toEqual(expected)
+        expect(updates[0]?.metadata?.sessionId).toBe(result.metadata.sessionId)
+
+        // result metadata
+        expect(result.metadata.model).toEqual(expected)
+      }),
+    ),
+  )
+
+  it.live("execute keeps slashes in the model id when parsing provider/vendor/model", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        let seen: SessionPrompt.PromptInput | undefined
+        const promptOps = stubOps({ onPrompt: (input) => (seen = input) })
+
+        const result = yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+            model: "openrouter/anthropic/claude-sonnet-4.5",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        const expected = {
+          providerID: ProviderID.make("openrouter"),
+          modelID: ModelID.make("anthropic/claude-sonnet-4.5"),
+        }
+        expect(seen?.model).toEqual(expected)
+        expect(result.metadata.model).toEqual(expected)
+      }),
+    ),
+  )
+
+  it.live("execute does not validate an unknown model, deferring to the prompt path", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        let seen: SessionPrompt.PromptInput | undefined
+        const promptOps = stubOps({ onPrompt: (input) => (seen = input) })
+
+        // "nonsense" has no slash, so parseModel yields an empty modelID rather than throwing.
+        // The tool still creates the child and emits metadata; SessionPrompt.getModel is what rejects it.
+        const result = yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+            model: "nonsense",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        const expected = { providerID: ProviderID.make("nonsense"), modelID: ModelID.make("") }
+        expect(seen?.model).toEqual(expected)
+        expect(result.metadata.model).toEqual(expected)
+
+        // the child session was created before the model could be rejected
+        const kids = yield* sessions.children(chat.id)
+        expect(kids).toHaveLength(1)
+        expect(kids[0]?.id).toBe(result.metadata.sessionId)
+      }),
+    ),
+  )
 })
