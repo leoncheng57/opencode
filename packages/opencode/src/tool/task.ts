@@ -5,6 +5,7 @@ import { Session } from "../session"
 import { SessionID, MessageID } from "../session/schema"
 import { MessageV2 } from "../session/message-v2"
 import { Agent } from "../agent/agent"
+import { Provider } from "../provider"
 import type { SessionPrompt } from "../session/prompt"
 import { Config } from "../config"
 import { Effect } from "effect"
@@ -28,6 +29,17 @@ const parameters = z.object({
     )
     .optional(),
   command: z.string().describe("The command that triggered this task").optional(),
+  model: z
+    .string()
+    .describe(
+      [
+        'Optional. Run this task on a specific model, written as "provider/model" (for example "anthropic/claude-sonnet-4-5").',
+        "Omit this parameter to keep the default behaviour: the subagent's own configured model, or your current model if it has none.",
+        "Only set it when this particular task genuinely needs a different model, since it overrides a model the subagent was deliberately configured with.",
+        "It applies to this invocation only and does not change the subagent session's model for later invocations.",
+      ].join(" "),
+    )
+    .optional(),
 })
 
 export const TaskTool = Tool.define(
@@ -99,10 +111,15 @@ export const TaskTool = Tool.define(
       const msg = yield* Effect.sync(() => MessageV2.get({ sessionID: ctx.sessionID, messageID: ctx.messageID }))
       if (msg.info.role !== "assistant") return yield* Effect.fail(new Error("Not an assistant message"))
 
-      const model = next.model ?? {
-        modelID: msg.info.modelID,
-        providerID: msg.info.providerID,
-      }
+      // Precedence: explicit per-invocation model > subagent's configured model > invoking assistant's model.
+      // `params.model` is only parsed here; existence is validated downstream by SessionPrompt.getModel,
+      // which is the same point at which an invalid agent-configured model fails today.
+      const model = params.model
+        ? Provider.parseModel(params.model)
+        : (next.model ?? {
+            modelID: msg.info.modelID,
+            providerID: msg.info.providerID,
+          })
 
       yield* ctx.metadata({
         title: params.description,
