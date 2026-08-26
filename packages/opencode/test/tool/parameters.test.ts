@@ -243,6 +243,22 @@ describe("tool parameters", () => {
       const parsed = parse(Task, { description: "d", prompt: "p", subagent_type: "general", background: true })
       expect(parsed.background).toBe(true)
     })
+    test("accepts an optional provider/model string", () => {
+      const parsed = parse(Task, {
+        description: "d",
+        prompt: "p",
+        subagent_type: "general",
+        model: "anthropic/claude-sonnet-4-5",
+      })
+      expect(parsed.model).toBe("anthropic/claude-sonnet-4-5")
+    })
+    test("treats the model as optional", () => {
+      const parsed = parse(Task, { description: "d", prompt: "p", subagent_type: "general" })
+      expect(parsed.model).toBeUndefined()
+    })
+    test("rejects a non-string model", () => {
+      expect(accepts(Task, { description: "d", prompt: "p", subagent_type: "general", model: 1 })).toBe(false)
+    })
     test("rejects missing prompt", () => {
       expect(accepts(Task, { description: "d", subagent_type: "general" })).toBe(false)
     })
