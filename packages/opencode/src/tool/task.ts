@@ -9,6 +9,7 @@ import { MessageV2 } from "../session/message-v2"
 import { Agent } from "../agent/agent"
 import { deriveSubagentSessionPermission } from "../agent/subagent-permissions"
 import type { SessionPrompt } from "../session/prompt"
+import { Provider } from "@/provider/provider"
 import { Config } from "@/config/config"
 import { Effect, Exit, Schema, Scope } from "effect"
 import { EffectBridge } from "@/effect/bridge"
@@ -49,6 +50,14 @@ const BaseParameterFields = {
       "This should only be set if you mean to resume a previous task (you can pass a prior task_id and the task will continue the same subagent session as before instead of creating a fresh one)",
   }),
   command: Schema.optional(Schema.String).annotate({ description: "The command that triggered this task" }),
+  model: Schema.optional(Schema.String).annotate({
+    description: [
+      'Optional. Run this task on a specific model, written as "provider/model" (for example "anthropic/claude-sonnet-4-5").',
+      "Omit this parameter to keep the default behaviour: the subagent's own configured model, or your current model if it has none.",
+      "Only set it when this particular task genuinely needs a different model, since it overrides a model the subagent was deliberately configured with.",
+      "It applies to this invocation only and does not change the subagent session's model for later invocations.",
+    ].join(" "),
+  }),
 }
 
 const BaseParameters = Schema.Struct(BaseParameterFields)
@@ -84,6 +93,7 @@ export const TaskTool = Tool.define(
     const agent = yield* Agent.Service
     const background = yield* BackgroundJob.Service
     const config = yield* Config.Service
+    const provider = yield* Provider.Service
     const sessions = yield* Session.Service
     const scope = yield* Scope.Scope
     const flags = yield* RuntimeFlags.Service
@@ -133,6 +143,14 @@ export const TaskTool = Tool.define(
         return yield* Effect.fail(new Error(`Unknown agent type: ${params.subagent_type} is not a valid agent type`))
       }
 
+      // Resolve the explicit per-invocation model here -- before any child session is created, and
+      // before the foreground/background branch below, so both paths run the same model.
+      // `Provider.getModel` is the exact call SessionPrompt.getModel makes later, so validating now
+      // changes *when* an unavailable model fails, not *whether* it fails. Omitting `model` skips
+      // this entirely, leaving the existing fallback chain and its late validation untouched.
+      const explicitModel = params.model ? Provider.parseModel(params.model) : undefined
+      if (explicitModel) yield* provider.getModel(explicitModel.providerID, explicitModel.modelID)
+
       const session = params.task_id
         ? yield* sessions.get(SessionID.make(params.task_id)).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
         : undefined
@@ -178,10 +196,12 @@ export const TaskTool = Tool.define(
       if (msg.info.role !== "assistant") return yield* Effect.fail(new Error("Not an assistant message"))
       const variant = msg.info.variant
 
-      const model = next.model ?? {
-        modelID: msg.info.modelID,
-        providerID: msg.info.providerID,
-      }
+      // Precedence: explicit per-invocation model > subagent's configured model > invoking assistant's model.
+      const model = explicitModel ??
+        next.model ?? {
+          modelID: msg.info.modelID,
+          providerID: msg.info.providerID,
+        }
       const metadata = {
         parentSessionId: ctx.sessionID,
         sessionId: nextSession.id,
@@ -206,7 +226,9 @@ export const TaskTool = Tool.define(
             modelID: model.modelID,
             providerID: model.providerID,
           },
-          variant: next.model ? undefined : variant,
+          // The parent's variant only describes the parent's model, so it is inherited solely when
+          // the child actually runs that model -- i.e. no explicit and no agent-configured override.
+          variant: explicitModel || next.model ? undefined : variant,
           agent: next.name,
           parts,
         })

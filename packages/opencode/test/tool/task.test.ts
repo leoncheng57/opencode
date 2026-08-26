@@ -10,6 +10,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { Config } from "@/config/config"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
+import { Provider } from "@/provider/provider"
 import { Session } from "@/session/session"
 import type { SessionPrompt } from "../../src/session/prompt"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
@@ -42,6 +43,7 @@ const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
       EventV2Bridge.node,
       Config.node,
       CrossSpawnSpawner.node,
+      Provider.node,
       Session.node,
       SessionProjector.node,
       SessionRunState.node,
