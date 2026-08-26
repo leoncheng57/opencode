@@ -10,12 +10,14 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { Config } from "@/config/config"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
+import { Provider } from "@/provider/provider"
 import { Session } from "@/session/session"
 import type { SessionPrompt } from "../../src/session/prompt"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 
+import type * as Tool from "../../src/tool/tool"
 import { TaskTool, type TaskPromptOps } from "../../src/tool/task"
 import { Truncate } from "@/tool/truncate"
 import { ToolRegistry } from "@/tool/registry"
@@ -34,6 +36,33 @@ const ref = {
   modelID: ModelV2.ID.make("test-model"),
 }
 
+const model = (id: string) => ({ providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make(id) })
+
+type TaskToolDef = Tool.InferDef<typeof TaskTool>
+type TaskArgs = Parameters<TaskToolDef["execute"]>[0]
+type TaskContext = Parameters<TaskToolDef["execute"]>[1]
+
+// A config-declared provider registers deterministically: `Provider.getModel` is a catalog lookup,
+// so these resolve without network access or loading the npm SDK. `vendor/deep-model` exists to
+// prove a model id containing slashes survives parsing.
+const providerConfig = {
+  provider: {
+    test: {
+      name: "Test",
+      id: "test",
+      env: [],
+      npm: "@ai-sdk/openai-compatible",
+      models: {
+        "test-model": { id: "test-model", name: "Test Model" },
+        "alt-model": { id: "alt-model", name: "Alt Model" },
+        "agent-model": { id: "agent-model", name: "Agent Model" },
+        "vendor/deep-model": { id: "vendor/deep-model", name: "Deep Model" },
+      },
+      options: { apiKey: "test-key", baseURL: "http://127.0.0.1:1/v1" },
+    },
+  },
+}
+
 const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
   LayerNode.compile(
     LayerNode.group([
@@ -42,6 +71,7 @@ const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
       EventV2Bridge.node,
       Config.node,
       CrossSpawnSpawner.node,
+      Provider.node,
       Session.node,
       SessionProjector.node,
       SessionRunState.node,
@@ -1098,4 +1128,269 @@ describe("tool.task", () => {
       expect((yield* jobs.get(grandchild.id))?.status).toBe("cancelled")
     }),
   )
+
+  describe("model selection", () => {
+    // Keep `def.execute` called directly at each site so its Effect type stays inferred; only the
+    // boilerplate literals are factored out here.
+    const args = (extra: Partial<TaskArgs> = {}): TaskArgs => ({
+      description: "inspect bug",
+      prompt: "look into the cache key path",
+      subagent_type: "general",
+      ...extra,
+    })
+    const context = (extra: Pick<TaskContext, "sessionID" | "messageID"> & Partial<TaskContext>): TaskContext => ({
+      agent: "build",
+      abort: new AbortController().signal,
+      messages: [],
+      metadata: () => Effect.void,
+      ask: () => Effect.void,
+      ...extra,
+    })
+
+    it.instance(
+      "explicit model overrides the invoking assistant's model",
+      () =>
+        Effect.gen(function* () {
+          const { chat, assistant } = yield* seed()
+          const def = yield* (yield* TaskTool).init()
+          let seen: SessionPrompt.PromptInput | undefined
+          const promptOps = stubOps({ onPrompt: (input) => (seen = input) })
+
+          const result = yield* def.execute(
+            args({ model: "test/alt-model" }),
+            context({ sessionID: chat.id, messageID: assistant.id, extra: { promptOps } }),
+          )
+
+          expect(seen?.model).toEqual(model("alt-model"))
+          expect(result.metadata.model).toEqual(model("alt-model"))
+          // the assistant's own model is test-model, and its variant does not follow a different model
+          expect(seen?.model).not.toEqual(ref)
+          expect(seen?.variant).toBeUndefined()
+        }),
+      { config: providerConfig },
+    )
+
+    it.instance(
+      "explicit model overrides the subagent's configured model",
+      () =>
+        Effect.gen(function* () {
+          const { chat, assistant } = yield* seed()
+          const def = yield* (yield* TaskTool).init()
+          let seen: SessionPrompt.PromptInput | undefined
+          const promptOps = stubOps({ onPrompt: (input) => (seen = input) })
+
+          const result = yield* def.execute(
+            args({ subagent_type: "pinned", model: "test/alt-model" }),
+            context({ sessionID: chat.id, messageID: assistant.id, extra: { promptOps } }),
+          )
+
+          expect(seen?.model).toEqual(model("alt-model"))
+          expect(result.metadata.model).toEqual(model("alt-model"))
+        }),
+      {
+        config: {
+          ...providerConfig,
+          agent: { pinned: { mode: "subagent" as const, model: "test/agent-model" } },
+        },
+      },
+    )
+
+    it.instance(
+      "omitting the model preserves the existing fallback chain",
+      () =>
+        Effect.gen(function* () {
+          const def = yield* (yield* TaskTool).init()
+
+          // no agent model configured -> falls back to the invoking assistant's model, variant inherited
+          const inherited = yield* seed()
+          let fromAssistant: SessionPrompt.PromptInput | undefined
+          yield* def.execute(
+            args(),
+            context({
+              sessionID: inherited.chat.id,
+              messageID: inherited.assistant.id,
+              extra: { promptOps: stubOps({ onPrompt: (input) => (fromAssistant = input) }) },
+            }),
+          )
+          expect(fromAssistant?.model).toEqual(ref)
+          expect(fromAssistant?.variant).toBe("xhigh")
+
+          // agent model configured -> wins over the assistant's model, variant dropped as before
+          const pinned = yield* seed("Pinned agent")
+          let fromAgent: SessionPrompt.PromptInput | undefined
+          yield* def.execute(
+            args({ subagent_type: "pinned" }),
+            context({
+              sessionID: pinned.chat.id,
+              messageID: pinned.assistant.id,
+              extra: { promptOps: stubOps({ onPrompt: (input) => (fromAgent = input) }) },
+            }),
+          )
+          expect(fromAgent?.model).toEqual(model("agent-model"))
+          expect(fromAgent?.variant).toBeUndefined()
+        }),
+      {
+        config: {
+          ...providerConfig,
+          agent: { pinned: { mode: "subagent" as const, model: "test/agent-model" } },
+        },
+      },
+    )
+
+    it.instance(
+      "explicit model on a resumed task_id applies without creating another child",
+      () =>
+        Effect.gen(function* () {
+          const sessions = yield* Session.Service
+          const { chat, assistant } = yield* seed()
+          const child = yield* sessions.create({ parentID: chat.id, title: "Existing child" })
+          const def = yield* (yield* TaskTool).init()
+          let seen: SessionPrompt.PromptInput | undefined
+          const promptOps = stubOps({ onPrompt: (input) => (seen = input) })
+
+          const result = yield* def.execute(
+            args({ task_id: child.id, model: "test/alt-model" }),
+            context({ sessionID: chat.id, messageID: assistant.id, extra: { promptOps } }),
+          )
+
+          const kids = yield* sessions.children(chat.id)
+          expect(kids).toHaveLength(1)
+          expect(kids[0]?.id).toBe(child.id)
+          expect(result.metadata.sessionId).toBe(child.id)
+          expect(seen?.sessionID).toBe(child.id)
+          expect(seen?.model).toEqual(model("alt-model"))
+
+          // per-invocation only: the child session itself keeps no model of its own
+          expect((yield* sessions.get(child.id)).model).toBeUndefined()
+        }),
+      { config: providerConfig },
+    )
+
+    it.instance(
+      "running and result metadata report the selected model",
+      () =>
+        Effect.gen(function* () {
+          const { chat, assistant } = yield* seed()
+          const def = yield* (yield* TaskTool).init()
+          const updates: { title?: string; metadata?: any }[] = []
+
+          const result = yield* def.execute(
+            args({ model: "test/alt-model" }),
+            context({
+              sessionID: chat.id,
+              messageID: assistant.id,
+              extra: { promptOps: stubOps() },
+              metadata: (input) =>
+                Effect.sync(() => {
+                  updates.push(input)
+                }),
+            }),
+          )
+
+          // running metadata, emitted before the child is prompted
+          expect(updates).toHaveLength(1)
+          expect(updates[0]?.metadata?.model).toEqual(model("alt-model"))
+          expect(updates[0]?.metadata?.sessionId).toBe(result.metadata.sessionId)
+          // result metadata
+          expect(result.metadata.model).toEqual(model("alt-model"))
+        }),
+      { config: providerConfig },
+    )
+
+    it.instance(
+      "keeps slashes in the model id when parsing provider/vendor/model",
+      () =>
+        Effect.gen(function* () {
+          const { chat, assistant } = yield* seed()
+          const def = yield* (yield* TaskTool).init()
+          let seen: SessionPrompt.PromptInput | undefined
+          const promptOps = stubOps({ onPrompt: (input) => (seen = input) })
+
+          const result = yield* def.execute(
+            args({ model: "test/vendor/deep-model" }),
+            context({ sessionID: chat.id, messageID: assistant.id, extra: { promptOps } }),
+          )
+
+          expect(seen?.model).toEqual(model("vendor/deep-model"))
+          expect(result.metadata.model).toEqual(model("vendor/deep-model"))
+        }),
+      { config: providerConfig },
+    )
+
+    it.instance(
+      "rejects an unknown or malformed model before creating a child",
+      () =>
+        Effect.gen(function* () {
+          const sessions = yield* Session.Service
+          const def = yield* (yield* TaskTool).init()
+
+          for (const candidate of ["test/missing-model", "nonsense"]) {
+            const { chat, assistant } = yield* seed(`Attempt ${candidate}`)
+            let prompted = false
+            const updates: unknown[] = []
+            const exit = yield* def
+              .execute(
+                args({ model: candidate }),
+                context({
+                  sessionID: chat.id,
+                  messageID: assistant.id,
+                  extra: { promptOps: stubOps({ onPrompt: () => (prompted = true) }) },
+                  metadata: (input) =>
+                    Effect.sync(() => {
+                      updates.push(input)
+                    }),
+                }),
+              )
+              .pipe(Effect.exit)
+
+            expect(Exit.isFailure(exit)).toBe(true)
+            if (Exit.isSuccess(exit)) throw new Error("expected model rejection")
+            const failure = Cause.squash(exit.cause)
+            // the real error is Provider's own tagged error, not a generic wrapper
+            if (!Provider.ModelNotFoundError.isInstance(failure))
+              throw new Error(`expected ProviderModelNotFoundError, got ${String(failure)}`)
+            expect(failure._tag).toBe("ProviderModelNotFoundError")
+            expect(failure.message).toContain("Model not found:")
+            // validation happens early: no child session, the child is never prompted, and no
+            // running metadata was emitted -- so the failed part carries no model/child detail
+            expect(yield* sessions.children(chat.id)).toHaveLength(0)
+            expect(prompted).toBe(false)
+            expect(updates).toHaveLength(0)
+          }
+        }),
+      { config: providerConfig },
+    )
+
+    background.instance(
+      "a background task launch uses the explicitly selected model",
+      () =>
+        Effect.gen(function* () {
+          const jobs = yield* BackgroundJob.Service
+          const { chat, assistant } = yield* seed()
+          const def = yield* (yield* TaskTool).init()
+          // the completion handler injects a hand-back prompt into the *parent*, so collect every
+          // prompt and pick out the one actually addressed to the child
+          const prompts: SessionPrompt.PromptInput[] = []
+          const promptOps = stubOps({ text: "background done", onPrompt: (input) => prompts.push(input) })
+
+          const result = yield* def.execute(
+            args({ background: true, model: "test/alt-model" }),
+            context({ sessionID: chat.id, messageID: assistant.id, extra: { promptOps } }),
+          )
+
+          expect(result.metadata.background).toBe(true)
+          expect(result.metadata.model).toEqual(model("alt-model"))
+
+          const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
+          expect(waited.info?.status).toBe("completed")
+          expect(waited.info?.metadata?.model).toEqual(model("alt-model"))
+          // the child the background job actually prompted ran on the selected model
+          const childPrompt = prompts.find((input) => input.sessionID === result.metadata.sessionId)
+          expect(childPrompt).toBeDefined()
+          expect(childPrompt?.model).toEqual(model("alt-model"))
+          expect(childPrompt?.variant).toBeUndefined()
+        }),
+      { config: providerConfig },
+    )
+  })
 })

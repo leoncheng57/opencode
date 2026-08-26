@@ -313,6 +313,10 @@ exports[`tool parameters JSON Schema (wire shape) task 1`] = `
       "description": "A short (3-5 words) description of the task",
       "type": "string",
     },
+    "model": {
+      "description": "Optional. Run this task on a specific model, written as "provider/model" (for example "anthropic/claude-sonnet-4-5"). Omit this parameter to keep the default behaviour: the subagent's own configured model, or your current model if it has none. Only set it when this particular task genuinely needs a different model, since it overrides a model the subagent was deliberately configured with. It applies to this invocation only and does not change the subagent session's model for later invocations.",
+      "type": "string",
+    },
     "prompt": {
       "description": "The task for the agent to perform",
       "type": "string",
